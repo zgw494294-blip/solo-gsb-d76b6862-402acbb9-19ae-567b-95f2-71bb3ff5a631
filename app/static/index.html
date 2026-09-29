@@ -143,13 +143,31 @@
   }
   .badge.yes { background: #e8f2ff; color: #0d47a1; border-color: #b6d4f5; }
   .sub-title { font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+
+  /* 净宽输入 */
+  .width-box {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--ink);
+  }
+  .width-box input[type="number"] {
+    width: 84px; padding: 5px 6px;
+    border: 1px solid var(--line); border-radius: 6px;
+    font-size: 14px; text-align: center;
+  }
+  .width-box input[type="number"]:focus { outline: 2px solid #a5d6a7; border-color: var(--accent); }
+  .width-box .unit { color: var(--muted); }
+
+  /* 土方调配 */
+  .ew-net-pos { color: #c62828; }
+  .ew-net-neg { color: #1565c0; }
+  .flow-arrow { color: var(--muted); }
   footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
 <header>
   <h1>步道坡线规划台</h1>
-  <p>测点等间距 1 m · 地面/方案标高 0～200 整数厘米 · 相邻高差 ≤ 8 cm · 任意连续 5 段至少 1 段水平</p>
+  <p>测点等间距 1 m · 地面/方案标高 0～200 整数厘米 · 相邻高差 ≤ 8 cm · 任意连续 5 段至少 1 段水平 · 可行方案附土方调配核算</p>
 </header>
 
 <main>
@@ -170,9 +188,14 @@
       <button id="btnRemove">－ 删除末点</button>
       <button id="btnSample">载入示例</button>
       <button id="btnCalc" class="primary">计算方案</button>
-      <span class="point-count">修改标高后自动重算</span>
+      <span class="point-count">修改标高或净宽后自动重算</span>
+      <label class="width-box">
+        步道净宽
+        <input id="widthInput" type="number" min="0.5" max="10" step="0.01" value="1.50">
+        <span class="unit">米（0.5～10，最多两位小数）</span>
+      </label>
     </div>
-    <p class="hint">每个地面标高必须是 0～200 的整数厘米；测点间隔固定为 1 m。</p>
+    <p class="hint">每个地面标高必须是 0～200 的整数厘米；测点间隔固定为 1 m。土方按净宽乘以地面与方案高差的线性积分计，挖正填负。</p>
   </section>
 
   <section class="card">
@@ -213,6 +236,33 @@
     </div>
   </section>
 
+  <section class="card" id="earthworkCard" hidden>
+    <h2>土方调配核算 <span class="tag">净宽 <b id="ewWidth">–</b> 米 · 每段土方集中于该段中点，同段挖填先抵消，余量沿相邻中点调配，全线余量只经起点进出</span></h2>
+    <div class="summary">
+      <div class="metric"><span class="num" id="ewCut">–</span><span class="label">总挖方（m³）</span></div>
+      <div class="metric"><span class="num" id="ewFill">–</span><span class="label">总填方（m³）</span></div>
+      <div class="metric"><span class="num" id="ewNet">–</span><span class="label" id="ewNetLabel">全线净量（m³，挖−填）</span></div>
+      <div class="metric"><span class="num" id="ewWork">–</span><span class="label">运量距离（m³·m）</span></div>
+    </div>
+    <div class="tables">
+      <div>
+        <p class="sub-title">分段挖填（m³，线性积分；交点列为段内挖填变号位置，米）</p>
+        <table class="data">
+          <thead><tr><th>段号</th><th>挖方</th><th>填方</th><th>段净量</th><th>累计净量</th><th>交点</th></tr></thead>
+          <tbody id="ewSegBody"></tbody>
+        </table>
+      </div>
+      <div>
+        <p class="sub-title">调配流量（m³，正值朝终点；起点正＝向线内运入，负＝余量运出）</p>
+        <table class="data">
+          <thead><tr><th>序号</th><th>流向</th><th>距离（m）</th><th>有向净流量</th></tr></thead>
+          <tbody id="ewFlowBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <p class="hint" id="ewNote"></p>
+  </section>
+
   <footer>目标：总调整量最小；总调整量相同时，取方案标高序列字典序最小者。</footer>
 </main>
 
@@ -220,6 +270,7 @@
 "use strict";
 
 const N_MIN = 3, N_MAX = 16, H_MIN = 0, H_MAX = 200;
+const W_MIN = 0.5, W_MAX = 10;
 let ground = [100, 107, 114, 119, 124, 130];
 let lastResult = null;
 let debounceTimer = null;
@@ -258,6 +309,19 @@ function onEdit(e) {
   const v = Number(raw);
   ground[idx] = Number.isInteger(v) ? v : NaN;
   scheduleCalc();
+}
+
+function readWidth() {
+  const raw = $("widthInput").value.trim();
+  if (raw === "") return { ok: false, value: NaN, reason: "步道净宽必须填写（0.5～10 米，最多两位小数）。" };
+  if (!/^(?:\d+|\d*\.\d+)$/.test(raw))
+    return { ok: false, value: NaN, reason: "步道净宽必须是数字（0.5～10 米，最多两位小数）。" };
+  const w = Number(raw);
+  if (!Number.isFinite(w) || w < W_MIN || w > W_MAX)
+    return { ok: false, value: NaN, reason: "步道净宽必须在 0.5～10 米之间。" };
+  if (Math.round(w * 100) / 100 !== w)
+    return { ok: false, value: NaN, reason: "步道净宽最多保留两位小数。" };
+  return { ok: true, value: w, reason: null };
 }
 
 function addPoint() {
@@ -309,10 +373,12 @@ function clearBanner() {
 
 async function calculate() {
   const err = clientValidate();
-  if (err) {
+  const widthInfo = readWidth();
+  if (err || !widthInfo.ok) {
     lastResult = null;
     $("resultCard").hidden = true;
-    showBanner("error", "<b>非法输入：</b>" + escapeHtml(err));
+    $("earthworkCard").hidden = true;
+    showBanner("error", "<b>非法输入：</b>" + escapeHtml(err || widthInfo.reason));
     drawChart(null);
     return;
   }
@@ -320,18 +386,21 @@ async function calculate() {
     const resp = await fetch("/api/plan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ground: ground })
+      body: JSON.stringify({ ground: ground, width: widthInfo.value })
     });
     const data = await resp.json();
     if (resp.ok && data.feasible) {
       lastResult = data;
       clearBanner();
       $("resultCard").hidden = false;
+      $("earthworkCard").hidden = false;
       renderResult(data);
+      renderEarthwork(data.earthwork);
       drawChart(data);
     } else {
       lastResult = null;
       $("resultCard").hidden = true;
+      $("earthworkCard").hidden = true;
       const reason = (data && data.reason) ? data.reason : "计算失败。";
       showBanner("warn", "<b>无可行方案：</b>" + escapeHtml(reason));
       drawChart(null);
@@ -339,6 +408,7 @@ async function calculate() {
   } catch (e) {
     lastResult = null;
     $("resultCard").hidden = true;
+    $("earthworkCard").hidden = true;
     showBanner("error", "<b>请求失败：</b>无法连接计算服务（" + escapeHtml(String(e)) + "）");
     drawChart(null);
   }
@@ -383,6 +453,84 @@ function renderResult(r) {
         (s.horizontal ? "水平" : "—") + "</span></td>";
     sb.appendChild(tr);
   });
+}
+
+/* ---------- 土方调配核算 ---------- */
+
+function fmtNum(v, digits) {
+  digits = digits === undefined ? 3 : digits;
+  if (Math.abs(v) < 0.5 * Math.pow(10, -digits)) v = 0;  // 屏蔽 -0
+  return v.toLocaleString("zh-CN", {
+    minimumFractionDigits: 0, maximumFractionDigits: digits
+  });
+}
+function signedFmt(v, digits) {
+  return (v > 0 ? "+" : "") + fmtNum(v, digits);
+}
+function netClass(v) {
+  return v > 1e-9 ? "ew-net-pos" : (v < -1e-9 ? "ew-net-neg" : "");
+}
+function nodeLabel(name) {
+  if (name === "start") return "起点";
+  if (String(name).indexOf("midpoint:") === 0)
+    return "段" + Number(String(name).slice(9)) + "中点";
+  return String(name);
+}
+
+function renderEarthwork(ew) {
+  $("ewWidth").textContent = fmtNum(ew.width, 2);
+  $("ewCut").textContent = fmtNum(ew.total_cut);
+  $("ewFill").textContent = fmtNum(ew.total_fill);
+
+  const net = ew.total_net;
+  const netEl = $("ewNet");
+  netEl.textContent = signedFmt(net);
+  netEl.className = "num " + netClass(net);
+  $("ewNetLabel").textContent =
+    net > 1e-9 ? "全线净余（m³，需经起点运出）"
+    : net < -1e-9 ? "全线净缺（m³，需经起点运入）"
+    : "全线净量（m³，挖填平衡）";
+  $("ewWork").textContent = fmtNum(ew.transport_work);
+
+  const sb = $("ewSegBody");
+  sb.innerHTML = "";
+  ew.segments.forEach(s => {
+    const tr = document.createElement("tr");
+    const cross = (s.cross_at === null || s.cross_at === undefined)
+      ? "—" : fmtNum(s.cross_at, 2);
+    tr.innerHTML =
+      "<td>" + s.index + "</td>" +
+      "<td>" + fmtNum(s.cut) + "</td>" +
+      "<td>" + fmtNum(s.fill) + "</td>" +
+      '<td class="' + netClass(s.net) + '">' + signedFmt(s.net) + "</td>" +
+      '<td class="' + netClass(s.cumulative_net) + '">' +
+        signedFmt(s.cumulative_net) + "</td>" +
+      "<td>" + cross + "</td>";
+    sb.appendChild(tr);
+  });
+
+  const fb = $("ewFlowBody");
+  fb.innerHTML = "";
+  ew.flows.forEach(f => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + f.index + "</td>" +
+      "<td>" + nodeLabel(f.from) + ' <span class="flow-arrow">→</span> ' +
+        nodeLabel(f.to) + "</td>" +
+      "<td>" + fmtNum(f.distance, 1) + "</td>" +
+      '<td class="' + netClass(f.flow) + '">' + signedFmt(f.flow) + "</td>";
+    fb.appendChild(tr);
+  });
+
+  const q0 = ew.flows.length ? ew.flows[0].flow : 0;
+  let note;
+  if (q0 > 1e-9)
+    note = "全线净缺：需经起点向线内运入 " + fmtNum(q0) + " m³（起点至首段中点流量为正）。";
+  else if (q0 < -1e-9)
+    note = "全线净余：有 " + fmtNum(-q0) + " m³ 余量回流至起点运出（起点至首段中点流量为负）。";
+  else
+    note = "全线挖填平衡，起点处无进出，全部土方在相邻中点间调配完成。";
+  $("ewNote").textContent = note + " 体积与流量计算全程不取整，显示值保留至多 3 位小数。";
 }
 
 /* ---------- Canvas 绘图 ---------- */
@@ -536,6 +684,7 @@ $("btnAdd").addEventListener("click", addPoint);
 $("btnRemove").addEventListener("click", removePoint);
 $("btnSample").addEventListener("click", loadSample);
 $("btnCalc").addEventListener("click", calculate);
+$("widthInput").addEventListener("input", scheduleCalc);
 window.addEventListener("resize", () => drawChart(lastResult));
 
 renderEditor();
