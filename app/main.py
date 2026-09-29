@@ -33,8 +33,12 @@ async def api_plan(request: Request) -> JSONResponse:
     if not isinstance(payload, dict) or "ground" not in payload:
         return _error("请求 JSON 必须包含 ground 字段（地面标高数组）。", status=400)
 
+    width = payload.get("width", None)
+    if "width" not in payload or width is None:
+        return _error("请求 JSON 必须包含 width 字段（步道净宽，米）。", status=400)
+
     try:
-        result = plan_trail(payload["ground"])
+        result = plan_trail(payload["ground"], width)
     except PlanError as exc:
         return _error(str(exc))
     return JSONResponse(status_code=200, content=result)

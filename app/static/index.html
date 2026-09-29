@@ -94,6 +94,16 @@
   }
   button.primary:hover { background: var(--accent-dark); color: #fff; }
   .point-count { font-size: 13px; color: var(--muted); }
+  .width-box {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-left: 12px; font-size: 13px; color: var(--ink);
+  }
+  .width-box input[type="number"] {
+    width: 86px; padding: 5px 6px;
+    border: 1px solid var(--line); border-radius: 6px;
+    font-size: 14px; text-align: center;
+  }
+  .width-box input[type="number"]:focus { outline: 2px solid #a5d6a7; border-color: var(--accent); }
 
   /* 提示条 */
   .banner {
@@ -137,6 +147,8 @@
   table.data th { color: var(--muted); font-weight: normal; font-size: 12px; }
   table.data td.delta-pos { color: #c62828; }
   table.data td.delta-neg { color: #1565c0; }
+  table.data td.flow-pos { color: #c62828; }
+  table.data td.flow-neg { color: #1565c0; }
   .badge {
     display: inline-block; font-size: 11px; border-radius: 10px;
     padding: 1px 9px; border: 1px solid var(--line); color: var(--muted);
@@ -171,8 +183,12 @@
       <button id="btnSample">载入示例</button>
       <button id="btnCalc" class="primary">计算方案</button>
       <span class="point-count">修改标高后自动重算</span>
+      <label class="width-box">步道净宽
+        <input id="widthInput" type="number" min="0.5" max="10" step="0.01" value="2.00">
+        米（0.5～10，最多两位小数）
+      </label>
     </div>
-    <p class="hint">每个地面标高必须是 0～200 的整数厘米；测点间隔固定为 1 m。</p>
+    <p class="hint">每个地面标高必须是 0～200 的整数厘米；测点间隔固定为 1 m。净宽用于土方调配核算。</p>
   </section>
 
   <section class="card">
@@ -213,6 +229,33 @@
     </div>
   </section>
 
+  <section class="card" id="earthCard" hidden>
+    <h2>土方调配核算 <span class="tag">净宽 <b id="ewWidth">–</b> 米 · 体积单位 m³ · 段内挖填先抵消，余量在相邻中点间调配，全线净余/净缺只经起点进出</span></h2>
+    <div class="summary">
+      <div class="metric"><span class="num" id="ewCut">–</span><span class="label">总挖方（m³）</span></div>
+      <div class="metric"><span class="num" id="ewFill">–</span><span class="label">总填方（m³）</span></div>
+      <div class="metric"><span class="num" id="ewNet">–</span><span class="label">全线净量（m³，＋净余／－净缺）</span></div>
+      <div class="metric"><span class="num" id="ewHaul">–</span><span class="label">运量距离 Σ|流量|×距离（m³·m）</span></div>
+    </div>
+    <div class="tables">
+      <div>
+        <p class="sub-title">分段挖填与累计净量（m³）</p>
+        <table class="data">
+          <thead><tr><th>段号</th><th>挖方</th><th>填方</th><th>段净量</th><th>段后累计净量</th></tr></thead>
+          <tbody id="ewSegBody"></tbody>
+        </table>
+      </div>
+      <div>
+        <p class="sub-title">调配流向（有向净流量，正值朝终点）</p>
+        <table class="data">
+          <thead><tr><th>路段</th><th>距离（m）</th><th>净流量（m³）</th><th>流向</th></tr></thead>
+          <tbody id="ewFlowBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <p class="hint">每段地面与方案标高按线性变化积分；段内高差变号时在交点拆分。各中点余量按前缀累计唯一调配：流量为正表示土向终点方向运送，为负表示向起点回运；全线净量为正时经起点运出，为负时由起点运入补方。</p>
+  </section>
+
   <footer>目标：总调整量最小；总调整量相同时，取方案标高序列字典序最小者。</footer>
 </main>
 
@@ -220,7 +263,9 @@
 "use strict";
 
 const N_MIN = 3, N_MAX = 16, H_MIN = 0, H_MAX = 200;
+const WIDTH_MIN = 0.5, WIDTH_MAX = 10;
 let ground = [100, 107, 114, 119, 124, 130];
+let trailWidth = 2.0;
 let lastResult = null;
 let debounceTimer = null;
 
@@ -257,6 +302,25 @@ function onEdit(e) {
   if (raw === "") { ground[idx] = NaN; scheduleCalc(); return; }
   const v = Number(raw);
   ground[idx] = Number.isInteger(v) ? v : NaN;
+  scheduleCalc();
+}
+
+function readWidth() {
+  // 返回 {ok, value, reason}：数值、范围、最多两位小数
+  const raw = $("widthInput").value.trim();
+  if (raw === "" || !/^\d+(\.\d+)?$/.test(raw))
+    return { ok: false, reason: "步道净宽必须是数字。" };
+  const w = Number(raw);
+  if (!Number.isFinite(w) || (raw.split(".")[1] || "").length > 2)
+    return { ok: false, reason: "步道净宽最多保留两位小数。" };
+  if (w < WIDTH_MIN || w > WIDTH_MAX)
+    return { ok: false, reason: "步道净宽必须在 0.5～10 米之间（当前 " + raw + " 米）。" };
+  return { ok: true, value: w };
+}
+
+function onWidthEdit() {
+  const w = readWidth();
+  if (w.ok) trailWidth = w.value;
   scheduleCalc();
 }
 
@@ -309,10 +373,14 @@ function clearBanner() {
 
 async function calculate() {
   const err = clientValidate();
-  if (err) {
+  const widthInfo = readWidth();
+  if (err || !widthInfo.ok) {
     lastResult = null;
     $("resultCard").hidden = true;
-    showBanner("error", "<b>非法输入：</b>" + escapeHtml(err));
+    $("earthCard").hidden = true;
+    const reason = err ? "<b>非法输入：</b>" + escapeHtml(err)
+                       : "<b>非法输入：</b>" + escapeHtml(widthInfo.reason);
+    showBanner("error", reason);
     drawChart(null);
     return;
   }
@@ -320,7 +388,7 @@ async function calculate() {
     const resp = await fetch("/api/plan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ground: ground })
+      body: JSON.stringify({ ground: ground, width: widthInfo.value })
     });
     const data = await resp.json();
     if (resp.ok && data.feasible) {
@@ -328,10 +396,17 @@ async function calculate() {
       clearBanner();
       $("resultCard").hidden = false;
       renderResult(data);
+      if (data.earthwork) {
+        $("earthCard").hidden = false;
+        renderEarthwork(data.earthwork);
+      } else {
+        $("earthCard").hidden = true;
+      }
       drawChart(data);
     } else {
       lastResult = null;
       $("resultCard").hidden = true;
+      $("earthCard").hidden = true;
       const reason = (data && data.reason) ? data.reason : "计算失败。";
       showBanner("warn", "<b>无可行方案：</b>" + escapeHtml(reason));
       drawChart(null);
@@ -339,6 +414,7 @@ async function calculate() {
   } catch (e) {
     lastResult = null;
     $("resultCard").hidden = true;
+    $("earthCard").hidden = true;
     showBanner("error", "<b>请求失败：</b>无法连接计算服务（" + escapeHtml(String(e)) + "）");
     drawChart(null);
   }
@@ -382,6 +458,57 @@ function renderResult(r) {
       '<td><span class="badge ' + (s.horizontal ? "yes" : "") + '">' +
         (s.horizontal ? "水平" : "—") + "</span></td>";
     sb.appendChild(tr);
+  });
+}
+
+/* ---------- 土方调配核算 ---------- */
+
+function fmtV(v) {
+  // 展示保留 3 位小数；计算过程不在前端取整（由后端完成）
+  const s = (v >= 0 ? "" : "−") + Math.abs(v).toFixed(3);
+  return s;
+}
+
+function renderEarthwork(ew) {
+  $("ewWidth").textContent = String(ew.width);
+  $("ewCut").textContent = ew.total_cut.toFixed(3);
+  $("ewFill").textContent = ew.total_fill.toFixed(3);
+  const netEl = $("ewNet");
+  netEl.textContent = fmtV(ew.total_net);
+  netEl.className = "num " + (ew.total_net > 0 ? "delta-pos" : ew.total_net < 0 ? "delta-neg" : "");
+  $("ewHaul").textContent = ew.haul_distance.toFixed(3);
+
+  const sb = $("ewSegBody");
+  sb.innerHTML = "";
+  ew.segments.forEach((s, i) => {
+    const tr = document.createElement("tr");
+    const netCls = s.net > 0 ? "delta-pos" : s.net < 0 ? "delta-neg" : "";
+    const cum = ew.cumulative_net[i];
+    const cumCls = cum > 0 ? "delta-pos" : cum < 0 ? "delta-neg" : "";
+    tr.innerHTML =
+      "<td>" + s.index + "</td>" +
+      "<td>" + s.cut.toFixed(3) + "</td>" +
+      "<td>" + s.fill.toFixed(3) + "</td>" +
+      '<td class="' + netCls + '">' + fmtV(s.net) + "</td>" +
+      '<td class="' + cumCls + '">' + fmtV(cum) + "</td>";
+    sb.appendChild(tr);
+  });
+
+  const fb = $("ewFlowBody");
+  fb.innerHTML = "";
+  ew.flows.forEach(f => {
+    const tr = document.createElement("tr");
+    let dir;
+    if (f.flow > 0) dir = "→ 朝终点";
+    else if (f.flow < 0) dir = "← 朝起点";
+    else dir = "无调配";
+    const cls = f.flow > 0 ? "flow-pos" : f.flow < 0 ? "flow-neg" : "";
+    tr.innerHTML =
+      "<td>" + escapeHtml(f.from) + " → " + escapeHtml(f.to) + "</td>" +
+      "<td>" + f.distance.toFixed(1) + "</td>" +
+      '<td class="' + cls + '">' + fmtV(f.flow) + "</td>" +
+      '<td><span class="badge ' + (f.flow !== 0 ? "yes" : "") + '">' + dir + "</span></td>";
+    fb.appendChild(tr);
   });
 }
 
@@ -536,6 +663,7 @@ $("btnAdd").addEventListener("click", addPoint);
 $("btnRemove").addEventListener("click", removePoint);
 $("btnSample").addEventListener("click", loadSample);
 $("btnCalc").addEventListener("click", calculate);
+$("widthInput").addEventListener("input", onWidthEdit);
 window.addEventListener("resize", () => drawChart(lastResult));
 
 renderEditor();
